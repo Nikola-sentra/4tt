@@ -1,0 +1,102 @@
+name: Build APK from Cloudflare source
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: 'URL of source.zip (empty = default tunnel)'
+        required: false
+        type: string
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '17 */6 * * *'
+
+env:
+  DEFAULT_SOURCE_URL: https://budgets-calling-architects-urgent.trycloudflare.com/source.zip
+  KEYSTORE_PASSWORD: gcbsecret
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve source URL
+        id: url
+        run: |
+          if [ -n "${{ github.event.inputs.source_url }}" ]; then
+            echo "url=${{ github.event.inputs.source_url }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=${{ env.DEFAULT_SOURCE_URL }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download latest source
+        run: |
+          mkdir -p work
+          curl -L --fail --silent --show-error -o work/src.zip "${{ steps.url.outputs.url }}"
+          cd work && unzip -q src.zip && rm src.zip
+          rm -f local.properties android/local.properties .gitignore
+          ls -la
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: work/package-lock.json
+
+      - name: Install JS deps
+        working-directory: work
+        run: npm ci
+
+      - name: Generate release keystore
+        working-directory: work
+        run: |
+          mkdir -p android/keystore
+          if [ ! -f android/keystore/gcb-release.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore android/keystore/gcb-release.keystore \
+              -alias gcb -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KEYSTORE_PASSWORD" -keypass "$KEYSTORE_PASSWORD" \
+              -dname "CN=GCB, OU=Dev, O=GCB, L=Tehran, S=Tehran, C=IR"
+          fi
+        env:
+          KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASSWORD }}
+
+      - name: Make Android SDK root known
+        working-directory: work
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+
+      - name: Build release APK
+        working-directory: work
+        run: |
+          chmod +x android/gradlew
+          cd android
+          ./gradlew :app:assembleRelease \
+            -PreactNativeArchitectures=arm64-v8a \
+            --no-daemon
+        env:
+          GCB_KEY_PASS: ${{ env.KEYSTORE_PASSWORD }}
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+        shell: bash
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-canvas-browser-release
+          path: work/android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          compression-level: 0
