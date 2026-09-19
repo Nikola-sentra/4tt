@@ -1,21 +1,20 @@
-name: Build & Release APK
+name: Build Release APK
 
 on:
   workflow_dispatch:
     inputs:
       source_url:
-        description: 'لینک مستقیم ZIP سورس (خالی = بیلد از همون ریپو شما)'
+        description: 'Optional zip URL to build from. Leave empty to build the pushed repo.'
         required: false
         type: string
         default: ''
       app_version:
-        description: 'نسخه اپ (مثل 1.0.0)'
+        description: 'Version name (e.g. 1.0.0)'
         required: false
         type: string
         default: '1.0.0'
   push:
     branches: [main]
-    tags: ['v*']
 
 permissions:
   contents: write
@@ -27,12 +26,13 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Download source zip from link
+      - name: Download source zip (optional)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.source_url != '' }}
         run: |
+          mkdir -p src_tmp
           curl -fSL "$SOURCE_URL" -o /tmp/src.zip
           unzip -o /tmp/src.zip -d /tmp/repo
-          rsync -a --exclude 'node_modules' --exclude '.expo' --exclude 'dist' /tmp/repo/ ./
+          rsync -a --exclude 'node_modules' --exclude '.expo' /tmp/repo/ ./
         env:
           SOURCE_URL: ${{ inputs.source_url }}
 
@@ -95,6 +95,7 @@ jobs:
           s = open(p).read()
           if 'signingConfigs.release' not in s:
               s = s.replace('signingConfigs {', 'signingConfigs {', 1)
+              # insert a release signing config right after the opening brace of signingConfigs
               idx = s.index('signingConfigs {') + len('signingConfigs {')
               block = """
                 release {
@@ -104,7 +105,9 @@ jobs:
                     keyPassword RELEASE_KEY_PASSWORD
                 }"""
               s = s[:idx] + block + s[idx:]
+              # point the release buildType at the release signing config
               s = s.replace('signingConfig signingConfigs.debug', 'signingConfig signingConfigs.release')
+              # expose the properties
               s = s.replace('apply plugin: "com.android.application"', 'apply plugin: "com.android.application"' + chr(10) +
                   'def RELEASE_STORE_PASSWORD = System.getenv("STORE_PASS") ?: "gcbrelease"' + chr(10) +
                   'def RELEASE_KEY_ALIAS = System.getenv("KEY_ALIAS") ?: "release"' + chr(10) +
@@ -112,6 +115,7 @@ jobs:
               open(p, 'w').write(s)
           print("build.gradle patched")
           PY
+          cat android/app/build.gradle | sed -n '1,40p'
           cd android
           STORE_PASS="$STORE_PASS" KEY_ALIAS="$KEY_ALIAS" KEY_PASS="$KEY_PASS" ./gradlew assembleRelease --no-daemon
         env:
@@ -140,14 +144,3 @@ jobs:
           name: release-keystore
           path: android/app/release.keystore
           if-no-files-found: warn
-
-      - name: Create GitHub Release & attach APK
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" \
-            android/app/build/outputs/apk/release/*.apk \
-            --title "gemini-canvas-browser v${GITHUB_REF_NAME#v}" \
-            --notes "مرورگر کانواس - release build" \
-            || echo "Release creation skipped/failed (maybe exists)"
