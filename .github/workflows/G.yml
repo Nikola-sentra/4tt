@@ -1,20 +1,16 @@
-name: Build Release APK
+name: Build & Release APK
 
 on:
   workflow_dispatch:
     inputs:
-      source_url:
-        description: 'Optional zip URL to build from. Leave empty to build the pushed repo.'
-        required: false
-        type: string
-        default: ''
       app_version:
-        description: 'Version name (e.g. 1.0.0)'
+        description: 'نسخه اپ (مثل 1.0.0)'
         required: false
         type: string
         default: '1.0.0'
   push:
     branches: [main]
+    tags: ['v*']
 
 permissions:
   contents: write
@@ -26,38 +22,47 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Download source zip (optional)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.source_url != '' }}
+      - name: Resolve project dir (root or gcb/)
+        id: proj
+        shell: bash
         run: |
-          mkdir -p src_tmp
-          curl -fSL "$SOURCE_URL" -o /tmp/src.zip
-          unzip -o /tmp/src.zip -d /tmp/repo
-          rsync -a --exclude 'node_modules' --exclude '.expo' /tmp/repo/ ./
-        env:
-          SOURCE_URL: ${{ inputs.source_url }}
+          if [ -f package.json ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          else
+            D="$(dirname "$(find . -maxdepth 3 -name package-lock.json 2>/dev/null | head -1)")"
+            echo "dir=${D:-.}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "PROJECT_DIR=$D"
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Set up Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
-          cache: npm
 
-      - name: Set up Android SDK + accept licenses
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licenses (preinstalled SDK on runner)
+        run: |
+          SDKMANAGER=$(find /usr/local/lib/android/sdk/cmdline-tools -name sdkmanager 2>/dev/null | head -1)
+          echo "using sdkmanager: $SDKMANAGER"
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          fi
 
       - name: Install JS deps
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: npm ci
 
       - name: Expo prebuild (android)
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: npx expo prebuild --platform android --non-interactive
 
       - name: Set build version
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: |
           cd android
           sed -i "s/versionName \"1\.0\.0\"/versionName \"$APP_VERSION\"/" app/build.gradle 2>/dev/null || true
@@ -66,6 +71,7 @@ jobs:
 
       - name: Prepare release keystore
         shell: bash
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: |
           set -e
           KSTORE=android/app/release.keystore
@@ -87,6 +93,7 @@ jobs:
 
       - name: Wire signing into gradle + build release APK
         shell: bash
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: |
           set -e
           python3 - <<'PY'
@@ -95,7 +102,6 @@ jobs:
           s = open(p).read()
           if 'signingConfigs.release' not in s:
               s = s.replace('signingConfigs {', 'signingConfigs {', 1)
-              # insert a release signing config right after the opening brace of signingConfigs
               idx = s.index('signingConfigs {') + len('signingConfigs {')
               block = """
                 release {
@@ -105,9 +111,7 @@ jobs:
                     keyPassword RELEASE_KEY_PASSWORD
                 }"""
               s = s[:idx] + block + s[idx:]
-              # point the release buildType at the release signing config
               s = s.replace('signingConfig signingConfigs.debug', 'signingConfig signingConfigs.release')
-              # expose the properties
               s = s.replace('apply plugin: "com.android.application"', 'apply plugin: "com.android.application"' + chr(10) +
                   'def RELEASE_STORE_PASSWORD = System.getenv("STORE_PASS") ?: "gcbrelease"' + chr(10) +
                   'def RELEASE_KEY_ALIAS = System.getenv("KEY_ALIAS") ?: "release"' + chr(10) +
@@ -115,7 +119,6 @@ jobs:
               open(p, 'w').write(s)
           print("build.gradle patched")
           PY
-          cat android/app/build.gradle | sed -n '1,40p'
           cd android
           STORE_PASS="$STORE_PASS" KEY_ALIAS="$KEY_ALIAS" KEY_PASS="$KEY_PASS" ./gradlew assembleRelease --no-daemon
         env:
@@ -125,6 +128,7 @@ jobs:
 
       - name: Locate APK
         id: apk
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: |
           APK=$(find android/app/build/outputs/apk/release -name '*.apk' | head -1)
           echo "path=$APK" >> "$GITHUB_OUTPUT"
@@ -135,12 +139,24 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-apk
-          path: ${{ steps.apk.outputs.path }}
+          path: ${{ steps.proj.outputs.dir }}/${{ steps.apk.outputs.path }}
           if-no-files-found: error
 
       - name: Upload release keystore artifact (SAVE THIS for future updates)
         uses: actions/upload-artifact@v4
         with:
           name: release-keystore
-          path: android/app/release.keystore
+          path: ${{ steps.proj.outputs.dir }}/android/app/release.keystore
           if-no-files-found: warn
+
+      - name: Create GitHub Release & attach APK
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK_PATH: ${{ steps.proj.outputs.dir }}/${{ steps.apk.outputs.path }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "$APK_PATH" \
+            --title "gemini-canvas-browser v${GITHUB_REF_NAME#v}" \
+            --notes "مرورگر کانواس - release build" \
+            || echo "Release creation skipped/failed (maybe exists)"
